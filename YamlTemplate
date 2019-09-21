@@ -1,0 +1,110 @@
+#!/bin/bash
+
+if [[ "$1" == "--help" ]]; then 
+    echo -n "
+
+${0}
+========================================================
+
+Template Plugin to extend input for configmaps and secrets. 
+Requirements : bash, grep, sed, base64, shyaml, md5sum, awk
+
+Offers:
+ - Easy variable substitution           -- {{MY_VARNAME}}
+ - Reading from user input              -- {{MY_VARNAME | READ}}
+ - Reading from file                    -- {{MY_VARNAME | FILE:<filepath>}}
+ - Reading from file with templating    -- {{MY_VARNAME | TEMPLATE_FILE:<filepath>}}
+ - Base64 encoding for secrets          -- {{MY_VARNAME | BASE64}}
+
+Options are combineable, e.g. to read a password from user input and encode it: {{MY_SECRET | READ | BASE64}}
+Note:
+  Plain text multiline file inputs are not supported yet (due to indentation)
+  When using base64 encoding this is fine
+
+
+"
+    exit 0
+fi
+
+BASE_TEMPLATE=$(cat ${1:-} | shyaml -y -q get-value template)
+
+function processTemplate(){
+    TEMPLATE=$(cat ${1:-})
+    # echo "$TEMPLATE" 1>&2
+
+    ADD_HASH_ANNOTATION=false
+    IFS=$'\n'; 
+    SUBSTITUTES=($(echo "$TEMPLATE" | grep -oP "(\{{.*?\}})" | sort -u))
+
+    for subindex in "${!SUBSTITUTES[@]}"; do
+        MATCH=${SUBSTITUTES[subindex]}
+
+        EXTRACT=$(echo -e "${SUBSTITUTES[subindex]}"| sed -e "s/^{{//g" -e "s/}}$//g" -e "s/ //g")
+        IFS='|'; read -r -a TOKENS <<< "$EXTRACT"
+
+        varname=${TOKENS[0]}
+        varvalue=${!varname}
+
+        if [[ "${varname:0:9}" == "DATA_HASH" ]]; then 
+            ADD_HASH_ANNOTATION=true
+        else 
+            if [[ ${#TOKENS[@]} -gt 1 ]]; then 
+                ACTIONS=(${TOKENS[@]:1})
+                for index in "${!ACTIONS[@]}"
+                do
+                    action=${ACTIONS[index]}
+
+                    if [[ "$action" == "READ" ]]; then
+                    echo "Enter value for [$varname]": 1>&2
+                    read varvalue < /dev/tty
+                    fi
+                    if [[ "$action" == "BASE64" ]]; then
+                        varvalue=$(echo -n "$varvalue" | base64 -w 0)
+                    fi
+                    if [[ "${action:0:5}" == "FILE:" ]]; then
+                        filename=${action:5}
+                        if [[ -f $filename ]]; then
+                            varvalue=$(cat "$filename")
+                        fi
+                    fi
+                    if [[ "${action:0:14}" == "TEMPLATE_FILE:" ]]; then
+                        filename=${action:14}
+                        if [[ -f $filename ]]; then
+                            varvalue=$(processTemplate "$filename")
+                        fi
+                    fi
+                done
+            fi
+            # echo "$varname=$varvalue" 1>&2
+
+            ESCAPED_SUBS=$(echo "${SUBSTITUTES[subindex]}" |  sed -e 's/[]\/$*.^[]/\\&/g')
+            
+            # Escape value for use as a Sed replacement string.
+            IFS= read -d '' -r < <(sed -e ':a' -e '$!{N;ba' -e '}' -e 's/[&/\]/\\&/g; s/\n/\\&/g' <<<"$varvalue")
+            replaceEscaped=${REPLY%$'\n'}
+
+            TEMPLATE=$(echo "$TEMPLATE" | sed -e "s/${ESCAPED_SUBS}/${replaceEscaped}/g")
+        fi
+
+    done
+
+    if [[ $ADD_HASH_ANNOTATION == true ]]; then 
+
+        # echo "$TEMPLATE" 1>&2
+
+        varvalue=$(echo "$TEMPLATE" | shyaml -y -q get-value data | md5sum | awk '{print $1}')
+        # echo "VARVALUE [$varvalue]" 1>&2
+
+        ESCAPED_SUBS=$(echo "{{DATA_HASH}}" |  sed -e 's/[]\/$*.^[]/\\&/g')
+        
+        # Escape value for use as a Sed replacement string.
+        IFS= read -d '' -r < <(sed -e ':a' -e '$!{N;ba' -e '}' -e 's/[&/\]/\\&/g; s/\n/\\&/g' <<<"$varvalue")
+        replaceEscaped=${REPLY%$'\n'}
+
+        TEMPLATE=$(echo "$TEMPLATE" | sed -e "s/${ESCAPED_SUBS}/${replaceEscaped}/g")
+    fi
+
+    echo "$TEMPLATE"
+}
+
+echo "$BASE_TEMPLATE" | processTemplate
